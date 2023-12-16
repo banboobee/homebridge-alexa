@@ -7,14 +7,17 @@ var EventEmitter = require('events').EventEmitter;
 var os = require("os");
 
 const packageConfig = require('./package.json');
-let Service, Characteristic;
+let Service, Characteristic, HistoryService, homebridgelib, eve;
 
 var options = {};
-var alexaService;
+var alexaService = {};
 
 module.exports = function (homebridge) {
   Service = homebridge.hap.Service;
   Characteristic = homebridge.hap.Characteristic;
+  HistoryService = require('fakegato-history')(homebridge);
+  homebridgelib = require('homebridge-lib');
+  eve = new homebridgelib.EveHomeKitTypes(homebridge);
 
   homebridge.registerPlatform("homebridge-alexa", "Alexa", alexaHome);
 };
@@ -191,23 +194,132 @@ alexaHome.prototype.configureAccessory = function(accessory) {
 function AlexaService(name, log) {
   this.name = name;
   this.log = log;
+  this.services = [];
+  this.listenerStatus = false;
+  this.contactStatus = Characteristic.ContactSensorState.CONTACT_NOT_DETECTED;
+  this.timesOpened = 0;
+  this.lastReset = Math.round(new Date().valueOf()/1000) - Math.round(Date.parse('01 Jan 2001 00:00:00 GMT')/1000);
+  this.lastActivation = 0;
+  this.listenerTimeout = undefined;
+
+  var hostname = os.hostname();
+
+  alexaService.informationService = new Service.AccessoryInformation();
+  alexaService.informationService
+    .setCharacteristic(Characteristic.Manufacturer, "homebridge-alexa")
+    .setCharacteristic(Characteristic.SerialNumber, "homebridge-alexa@"+hostname)
+    .setCharacteristic(Characteristic.FirmwareRevision, require('./package.json').version);
+  this.services.push(alexaService.informationService);
+
+  alexaService.contact = new Service.ContactSensor(this.name + ' contact');
+  alexaService.contact.setCharacteristic(
+    Characteristic.ContactSensorState,
+    Characteristic.ContactSensorState.CONTACT_NOT_DETECTED);
+  alexaService.contact.addOptionalCharacteristic(eve.Characteristics.OpenDuration);
+  alexaService.contact.getCharacteristic(eve.Characteristics.OpenDuration)
+    .onGet(() => 0);
+  alexaService.contact.addOptionalCharacteristic(eve.Characteristics.ClosedDuration);
+  alexaService.contact.getCharacteristic(eve.Characteristics.ClosedDuration)
+    .onGet(() => 0);
+  alexaService.contact.addOptionalCharacteristic(eve.Characteristics.TimesOpened);
+  alexaService.contact.getCharacteristic(eve.Characteristics.TimesOpened)
+    .onGet(() => this.timesOpened);
+  alexaService.contact.addOptionalCharacteristic(eve.Characteristics.LastActivation);
+  alexaService.contact.getCharacteristic(eve.Characteristics.LastActivation)
+    .onGet(() => {
+      return this.lastActivation && alexaService.historyService.getInitialTime() ? 
+	this.lastActivation - alexaService.historyService.getInitialTime() : 0
+    });
+  alexaService.contact.addOptionalCharacteristic(eve.Characteristics.ResetTotal);
+  alexaService.contact.getCharacteristic(eve.Characteristics.ResetTotal)
+    .onSet((reset) => {
+      this.timesOpened = 0;
+      this.lastReset = reset;
+      alexaService.contact.updateCharacteristic(eve.Characteristics.TimesOpened, 0);
+    })
+    .onGet(() => {
+      return this.lastReset
+    });
+  alexaService.contact.getCharacteristic(Characteristic.ContactSensorState)
+    .on('change', (event) => {
+      if (event.newValue !== event.oldValue) {
+	// this.log(`${this.name}: contact on change: ${JSON.stringify(event)}`);
+	this.contactStatus = event.newValue;
+        const entry = {
+          time: Math.round(new Date().valueOf()/1000),
+          contact: event.newValue
+        };
+        this.lastActivation = entry.time;
+        alexaService.contact.updateCharacteristic(
+	  eve.Characteristics.LastActivation,
+	  alexaService.historyService.getInitialTime() ? 
+	    this.lastActivation - alexaService.historyService.getInitialTime() : 0);
+        if (entry.contact) {
+	  this.timesOpened++;
+          alexaService.contact.updateCharacteristic(eve.Characteristics.TimesOpened, this.timesOpened);
+        }
+        alexaService.historyService.addEntry(entry);
+      }
+    });
+  this.services.push(alexaService.contact);
+  
+  alexaService.listener = new Service.Switch(this.name + ' listener');
+  alexaService.listener.getCharacteristic(Characteristic.On)
+    .onGet(() => this.listenerStatus)
+    .on('change', (event) => {
+      if (event.newValue !== event.oldValue) {
+	// this.log(`${this.name}: listener on change: ${JSON.stringify(event)}`);
+	this.listenerStatus = event.newValue;
+	if (event.newValue) {
+	  clearTimeout(this.listenerTimeout);
+	  this.listenerTimeout = setTimeout(() => {
+	    // this.log(`${this.name}: listener turned OFF.`);
+	    alexaService.listener.updateCharacteristic(Characteristic.On, false);
+	  }, 1000);
+	}
+        alexaService.historyService.addEntry({
+          time: Math.round(new Date().valueOf()/1000),
+          status: event.newValue
+        });
+      }
+    });
+  this.services.push(alexaService.listener);
+  
+  alexaService.historyService = new HistoryService('custom', this,
+   {storage: 'fs', filename: `${hostname.split(".")[0]}_${this.name}_persist.json`});
+  this.services.push(alexaService.historyService);
+  this.updateHistory();
 }
 
 AlexaService.prototype = {
   getServices: function () {
     // this.log("getServices", this.name);
-    // Information Service
-    var informationService = new Service.AccessoryInformation();
-    var hostname = os.hostname();
-
-    informationService
-      .setCharacteristic(Characteristic.Manufacturer, "homebridge-alexa")
-      .setCharacteristic(Characteristic.SerialNumber, hostname)
-      .setCharacteristic(Characteristic.FirmwareRevision, require('./package.json').version);
-    // Thermostat Service
-
-    alexaService = new Service.ContactSensor(this.name);
-
-    return [informationService, alexaService];
+    return this.services;
+  },
+  updateHistory: function () {
+    alexaService.historyService.addEntry({
+      time: Math.round(new Date().valueOf() / 1000),
+      contact: this.contactStatus,
+      status: this.listenerStatus})
+    setTimeout(() => {
+      this.updateHistory();
+    }, 10 * 60 * 1000);
   }
+
+  // getServices: function () {
+  //   // this.log("getServices", this.name);
+  //   // Information Service
+  //   var informationService = new Service.AccessoryInformation();
+  //   var hostname = os.hostname();
+
+  //   informationService
+  //     .setCharacteristic(Characteristic.Manufacturer, "homebridge-alexa")
+  //     .setCharacteristic(Characteristic.SerialNumber, hostname)
+  //     .setCharacteristic(Characteristic.FirmwareRevision, require('./package.json').version);
+  //   // Thermostat Service
+
+  //   alexaService = new Service.ContactSensor(this.name);
+
+  //   return [informationService, alexaService, alexaStream, historyService];
+  // }
 };
