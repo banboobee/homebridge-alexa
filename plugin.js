@@ -30,6 +30,7 @@ function alexaHome(log, config, api) {
   this.username = config['username'] || false;
   this.password = config['password'] || false;
   this.filter = config['filter'];
+  this.instanceBlacklist = config['instanceBlacklist'];
   this.beta = config['beta'] || false;
   this.events = config['routines'] || false;
   this.combine = config['combine'] || false;
@@ -134,6 +135,7 @@ alexaHome.prototype.didFinishLaunching = function () {
     combine: this.combine,
     speakers: this.speakers,
     filter: this.filter,
+    instanceBlacklist: this.instanceBlacklist,
     alexaService: alexaService,
     Characteristic: Characteristic,
     inputs: this.inputs,
